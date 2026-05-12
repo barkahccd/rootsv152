@@ -1,0 +1,67 @@
+{
+  "send": {
+    "workers": 5,
+    "maxLoopTx": 10000000,
+    "minDelayTxSeconds": 10,
+    "maxDelayTxSeconds": 100,
+    "amount": {
+      "min": "25",
+      "max": "28",
+      "decimals": 3
+    }
+  },
+  "swap": {
+    "enabled": true,
+    "workers": 1000,
+    "minOrderSizeUsd": 1.05,
+    "maxOrderSizeUsd": 3,
+    "minDelaySeconds": 5,
+    "maxDelaySeconds": 10,
+    "maxLoopTakes": 100000,
+    "hourlyMaxSwaps": 5,
+    "allowedPairs": [
+      "usdc_cc"
+    ],
+    "maker": {
+      "minBps": 0,
+      "maxBps": 1,
+      "expiresHours": 6,
+      "maxOpenOrders": 1,
+      "rateLimitCooldownMinutes": 62,
+      "balanceLockCooldownSeconds": 120,
+      "takerIdleSecondsBeforeMaker": 10,
+      "cancelAfterIdleMinutes": 5
+    },
+    "taker": {
+      "minBps": 1,
+      "maxTakesPerCounterpartyPerWeek": 5,
+      "balanceLockCooldownSeconds": 90,
+      "orderBlacklistSeconds": 60,
+      "maxDrainPerLoop": 1,
+      "fastScanIntervalSeconds": 2
+    }
+  },
+  "captcha": {
+    "provider": "2captcha",
+    "solverUrl": [
+      ""
+    ],
+    "apiKey": ""
+  },
+  "safety": {
+    "minHoldBalanceCc": 1
+  },
+  "ui": {
+    "dashboard": true,
+    "logLines": 15
+  },
+  "telegram": {
+    "enabled": true,
+    "botToken": "",
+    "allowedChatIds": [],
+    "autoReport": {
+      "enabled": true,
+      "intervalMinutes": 30
+    }
+  }
+}

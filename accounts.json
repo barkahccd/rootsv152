@@ -1,0 +1,20 @@
+{
+  "defaultAccount": "main",
+  "accounts": [
+    {
+      "name": "",
+      "email": "",
+      "address": ""
+    },
+    {
+      "name": "",
+      "email": "",
+      "address": ""
+    },
+    {
+      "name": "",
+      "email": "",
+      "address": ""
+    }
+  ]
+}
