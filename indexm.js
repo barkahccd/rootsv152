@@ -199,6 +199,100 @@ async function resetConnectionPool(options = {}) {
 }
 
 // ============================================================================
+// AUTO-FILL ETH BASE
+// ============================================================================
+// Monitors ETH balance on Base chain for each RootsFi account.
+// When balance drops below ETH_REFILL_THRESHOLD (0.0001 ETH), automatically
+// sends ETH_REFILL_AMOUNT (0.00044 ETH) from the master wallet configured
+// in accounts.json (masterWalletPrivateKey field).
+// ETH addresses are auto-fetched from the RootsFi API (wallets.ethAddress).
+// ============================================================================
+
+let ethAutoFillProvider = null;
+let ethAutoFillWallet = null;
+let ethAutoFillEnabled = false;
+const ethAddressByAccount = new Map();
+const ethRefillInFlight = new Map();
+const ETH_REFILL_THRESHOLD = 0.0001;
+const ETH_REFILL_AMOUNT = "0.00044";
+const BASE_CHAIN_ID = 8453;
+const BASE_RPC_URL = "https://mainnet.base.org";
+
+function initEthAutoFill(privateKey) {
+  if (!privateKey || privateKey === "ISI_PRIVATE_KEY_MASTER_WALLET_DISINI") {
+    console.log("[eth-fill] Master wallet not configured in accounts.json — auto-fill disabled");
+    ethAutoFillEnabled = false;
+    return;
+  }
+  try {
+    const { ethers } = require("ethers");
+    ethAutoFillProvider = new ethers.JsonRpcProvider(BASE_RPC_URL, BASE_CHAIN_ID);
+    ethAutoFillWallet = new ethers.Wallet(privateKey, ethAutoFillProvider);
+    ethAutoFillEnabled = true;
+    console.log(`[eth-fill] ✓ Master wallet: ${ethAutoFillWallet.address}`);
+    console.log(`[eth-fill]   Threshold: <${ETH_REFILL_THRESHOLD} ETH → refill ${ETH_REFILL_AMOUNT} ETH`);
+    console.log(`[eth-fill]   Chain: Base (${BASE_CHAIN_ID}) via ${BASE_RPC_URL}`);
+    ethAutoFillProvider.getBalance(ethAutoFillWallet.address).then(balance => {
+      const balEth = Number(ethers.formatEther(balance));
+      console.log(`[eth-fill]   Master balance: ${balEth.toFixed(6)} ETH`);
+      if (balEth < 0.001) {
+        console.log("[eth-fill]   ⚠ Master wallet balance low!");
+      }
+    }).catch(err => {
+      console.log(`[eth-fill]   Could not check master balance: ${err.message}`);
+    });
+  } catch (error) {
+    console.log(`[eth-fill] Failed to initialize: ${error.message}`);
+    ethAutoFillEnabled = false;
+  }
+}
+
+function cacheEthAddress(accountName, balanceData) {
+  if (!accountName || !isObject(balanceData)) return null;
+  const wallets = isObject(balanceData.wallets) ? balanceData.wallets : {};
+  const ethAddr = String(wallets.ethAddress || "").trim();
+  if (ethAddr && ethAddr.startsWith("0x") && ethAddr.length === 42) {
+    ethAddressByAccount.set(accountName, ethAddr);
+    return ethAddr;
+  }
+  return ethAddressByAccount.get(accountName) || null;
+}
+
+function maybeRefillEth(accountName, balanceData) {
+  if (!ethAutoFillEnabled || !ethAutoFillWallet) return;
+  const name = String(accountName || "").trim();
+  if (!name) return;
+
+  const ethBalance = otcGetAccountBalance("ETH", balanceData);
+  const ethAddress = cacheEthAddress(name, balanceData);
+
+  if (!ethAddress) return;
+  if (ethBalance >= ETH_REFILL_THRESHOLD) return;
+  if (ethRefillInFlight.has(name)) return;
+
+  console.log(`[eth-fill] ${name}: ETH ${ethBalance.toFixed(6)} < ${ETH_REFILL_THRESHOLD} → refilling ${ETH_REFILL_AMOUNT} ETH to ${ethAddress}`);
+
+  const refillPromise = (async () => {
+    try {
+      const { ethers } = require("ethers");
+      const tx = await ethAutoFillWallet.sendTransaction({
+        to: ethAddress,
+        value: ethers.parseEther(ETH_REFILL_AMOUNT),
+      });
+      console.log(`[eth-fill] ${name}: TX sent ${tx.hash}`);
+      const receipt = await tx.wait(1);
+      console.log(`[eth-fill] ${name}: ✓ Refilled ${ETH_REFILL_AMOUNT} ETH (block ${receipt.blockNumber})`);
+    } catch (error) {
+      console.log(`[eth-fill] ${name}: ✗ Refill failed: ${error.message}`);
+    } finally {
+      ethRefillInFlight.delete(name);
+    }
+  })();
+
+  ethRefillInFlight.set(name, refillPromise);
+}
+
+// ============================================================================
 // ADAPTIVE INTERNAL RECIPIENT STRATEGY
 // ============================================================================
 // Goals:
@@ -404,12 +498,31 @@ function recordOtcCounterpartyTake(username) {
 // Per-account swap window — 100% LOCAL counting.
 // Semua counting dilakukan lokal (recordOtcAccountSwap).
 // Server sync TIDAK digunakan untuk count — menghindari race condition.
-// Timer 60 menit dimulai saat swap pertama di round.
+// Window = clock-hour: xx:00 – xx:00 (reset tepat saat ganti jam).
+// Swap kapanpun di jam 06:xx → window tutup jam 07:00 tepat.
+// Swap kapanpun di jam 07:xx → window tutup jam 08:00 tepat.
 // 5 swap sukses = 1 round. Round naik via completeOtcAccountSwapRound().
 // key: account name, value: { count, windowStartMs, roundNumber }
 // ═══════════════════════════════════════════════════════════════════
 const otcAccountSwapWindow = new Map();
-const SWAP_WINDOW_MS = 60 * 60 * 1000;
+const SWAP_WINDOW_MS = 60 * 60 * 1000; // tetap ada untuk referensi internal
+
+// Hitung awal jam saat ini (clock-hour boundary).
+// Contoh: 06:45 → 06:00:00.000 | 07:58 → 07:00:00.000
+function getCurrentHourBoundaryMs(fromMs) {
+  const d = new Date(fromMs);
+  d.setMinutes(0, 0, 0);
+  return d.getTime();
+}
+
+// Hitung awal jam berikutnya.
+// Contoh: 06:45 → 07:00:00.000 | 07:58 → 08:00:00.000
+function getNextHourBoundaryMs(fromMs) {
+  const d = new Date(fromMs);
+  d.setMinutes(0, 0, 0);
+  d.setHours(d.getHours() + 1);
+  return d.getTime();
+}
 
 function getOtcAccountSwapWindow(accountName) {
   const key = String(accountName || "");
@@ -431,32 +544,40 @@ function getOtcAccountSwapRound(accountName) {
   return getOtcAccountSwapWindow(accountName).roundNumber || 1;
 }
 
-// Record 1 swap sukses. Jika ini swap pertama di round, mulai countdown.
+// Record 1 swap sukses.
+// windowStartMs = awal jam clock saat swap terjadi (clock-hour boundary).
+// Semua swap di jam yang sama masuk window yang sama.
+// Jika jam sudah ganti → otomatis mulai window baru dari 1.
 function recordOtcAccountSwap(accountName) {
   const key = String(accountName || "");
   if (!key) return;
   const w = getOtcAccountSwapWindow(key);
   const nowMs = Date.now();
+  const currentHourStart = getCurrentHourBoundaryMs(nowMs);
+  // Cek apakah window masih di jam yang sama
+  const sameHour = w.windowStartMs === currentHourStart;
   const next = {
-    count: w.count + 1,
-    windowStartMs: w.count === 0 ? nowMs : w.windowStartMs,
+    count: sameHour ? w.count + 1 : 1,
+    windowStartMs: currentHourStart,
     roundNumber: w.roundNumber || 1
   };
   otcAccountSwapWindow.set(key, next);
 }
 
-// Returns ms until the current window ends (0 if no active window or expired).
+// Returns ms sampai akhir window clock-hour saat ini.
 function getOtcAccountSwapResetMs(accountName) {
   const w = getOtcAccountSwapWindow(accountName);
   if (!w.windowStartMs) return 0;
-  return Math.max(0, w.windowStartMs + SWAP_WINDOW_MS - Date.now());
+  const windowEndMs = getNextHourBoundaryMs(w.windowStartMs);
+  return Math.max(0, windowEndMs - Date.now());
 }
 
-// Cek apakah window countdown sudah expired.
+// Cek apakah jam sudah berganti (window expired).
 function isOtcAccountSwapWindowExpired(accountName) {
   const w = getOtcAccountSwapWindow(accountName);
-  if (!w.windowStartMs) return false; // belum ada window
-  return Date.now() >= w.windowStartMs + SWAP_WINDOW_MS;
+  if (!w.windowStartMs) return false;
+  const windowEndMs = getNextHourBoundaryMs(w.windowStartMs);
+  return Date.now() >= windowEndMs;
 }
 
 // Dipanggil saat cap tercapai (5/5) DAN cooldown selesai → round naik.
@@ -485,6 +606,54 @@ function resetOtcAccountSwapWindow(accountName) {
     roundNumber: w.roundNumber || 1
   };
   otcAccountSwapWindow.set(key, next);
+}
+
+// Status order yang dihitung sebagai swap (filled + failed).
+// Cancelled / canceled / expired TIDAK dihitung sebagai swap.
+function isOtcSwapCountedStatus(status) {
+  const s = String(status || "").toLowerCase();
+  return s === "filled" || s === "failed";
+}
+
+// Status terminal (final) yang membuat order keluar dari in-flight.
+function isOtcTerminalStatus(status) {
+  const s = String(status || "").toLowerCase();
+  return s === "filled" || s === "failed" || s === "expired"
+    || s === "cancelled" || s === "canceled" || s === "rejected";
+}
+
+// Poll /orders (mine=true) sampai order ID tertentu mencapai status terminal,
+// atau hilang dari /orders mine. Dipakai untuk verifikasi setelah take/create
+// sebelum kita cek cap & lanjut swap berikutnya.
+// Return: { resolved, status, order } — resolved=true kalau dapat status final
+// atau order hilang. status="missing" kalau order tidak ditemukan.
+async function waitForOtcOrderResolution(client, orderId, opts = {}) {
+  const timeoutMs = Math.max(1000, Number(opts.timeoutMs) || 30000);
+  const pollIntervalMs = Math.max(500, Number(opts.pollIntervalMs) || 2000);
+  const allowMissing = opts.allowMissing !== false; // default true
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = null;
+  let lastOrder = null;
+  while (Date.now() < deadline) {
+    try {
+      const res = await client.getCrossOtcOrders(true);
+      const list = Array.isArray(res && res.data && res.data.orders)
+        ? res.data.orders
+        : (Array.isArray(res && res.data) ? res.data : []);
+      const found = list.find(o => String(o.id) === String(orderId));
+      if (!found) {
+        if (allowMissing) return { resolved: true, status: "missing", order: null };
+      } else {
+        lastOrder = found;
+        lastStatus = String(found.status || "").toLowerCase();
+        if (isOtcTerminalStatus(lastStatus)) {
+          return { resolved: true, status: lastStatus, order: found };
+        }
+      }
+    } catch (_) { /* swallow & retry */ }
+    await sleep(pollIntervalMs);
+  }
+  return { resolved: false, status: lastStatus, order: lastOrder };
 }
 
 // Short-lived blacklist for orders that returned HTTP 409 (already reserved/closed)
@@ -1750,7 +1919,7 @@ class PinnedDashboard {
     const L = [];
     const timeStr = (now.split(" ").pop() || now).slice(0, 8);
 
-    L.push(`${C.bold}${C.cyan}RootsFi V15.2${C.rst} ${C.dim}${timeStr}${C.rst}`);
+    L.push(`${C.bold}${C.cyan}RootsFi V15.3${C.rst} ${C.dim}${timeStr}${C.rst}`);
     L.push(`${C.dim}${rows.length} Akun ${modeLabel}${C.rst}`);
 
     const uptimeLabel = getGlobalUptimeLabel();
@@ -9116,6 +9285,7 @@ async function runOtcAccountWorker(account, context, statsBucket) {
   const selfProfileId = getSelfProfileIdFromBalance(balanceData);
   const initBal = formatOtcCcUsdc(balanceData);
   updateOtcAccountSnapshot(dashboard, account.name, { status: "IDLE", cc: initBal.cc, usdc: initBal.usdc, eth: initBal.eth, mk: 0, tk: 0 });
+  maybeRefillEth(account.name, balanceData);
   await refreshOtcAccountPoints(client, dashboard, account.name, accountLogTag);
   console.log(`${accountLogTag} [otc] Profile=${selfProfileId || "?"} — start scanning orders`);
 
@@ -9287,35 +9457,70 @@ async function runOtcAccountWorker(account, context, statsBucket) {
         const filled = isObject(takeResult && takeResult.data && takeResult.data.order)
           ? takeResult.data.order
           : null;
-        const status = filled ? filled.status : "?";
+        let status = String((filled && filled.status) || "").toLowerCase();
         const makerUsername = normalizeOtcUsername(order.makerUsername);
+
+        // VERIFIKASI: kalau status belum terminal, poll sampai resolve sebelum
+        // cek cap. Hindari race condition over-cap.
+        const isImmediateTerminal = isOtcTerminalStatus(status);
+        if (!isImmediateTerminal) {
+          await sleep(1500);
+          const verifyTimeoutMs = Math.max(5000, Number(takerCfg.takeVerifyTimeoutMs) || 20000);
+          const resolution = await waitForOtcOrderResolution(client, order.id, { timeoutMs: verifyTimeoutMs, pollIntervalMs: 2000 });
+          if (resolution.resolved && resolution.status && resolution.status !== "missing") {
+            status = String(resolution.status).toLowerCase();
+            console.log(`${accountLogTag} [otc] verify ${order.id.slice(0, 8)} → status=${status}`);
+          } else {
+            console.log(`${accountLogTag} [otc] verify ${order.id.slice(0, 8)} unresolved (last=${resolution.status || "?"}) — assume settled`);
+            // Default: treat as filled untuk consistency dengan perilaku lama.
+            status = "filled";
+          }
+        }
+
+        const countsAsSwap = isOtcSwapCountedStatus(status); // filled atau failed
+        const isCancelledLike = !countsAsSwap && (
+          status === "cancelled" || status === "canceled" || status === "expired" || status === "rejected"
+        );
+
         if (makerUsername) {
           recordOtcCounterpartyTake(makerUsername);
           const cnt = pruneOtcCounterpartyHistory(makerUsername, Date.now()).length;
           const limit = Number(takerCfg.maxTakesPerCounterpartyPerWeek)
             || Number(takerCfg.maxTakesPerCounterpartyPerHour) || 0;
           console.log(
-            `${accountLogTag} [otc] TAKE ok ${order.id.slice(0, 8)} status=${status} ` +
+            `${accountLogTag} [otc] TAKE ${countsAsSwap ? (status === "filled" ? "OK" : "FAIL") : (isCancelledLike ? "CXL" : "?")} ${order.id.slice(0, 8)} status=${status} ` +
             `maker=${order.makerUsername} (${cnt}${limit > 0 ? `/${limit}` : ""}/wk)`
           );
         } else {
-          console.log(`${accountLogTag} [otc] TAKE ok ${order.id.slice(0, 8)} status=${status}`);
+          console.log(`${accountLogTag} [otc] TAKE ${countsAsSwap ? (status === "filled" ? "OK" : "FAIL") : (isCancelledLike ? "CXL" : "?")} ${order.id.slice(0, 8)} status=${status}`);
         }
-        takesOk += 1;
-        statsBucket.takeOk += 1;
-        statsBucket.profitUsd += edge.estProfitUsd;
-        statsBucket.volumeUsd += edge.takerPaysUsd;
-        blacklistOtcOrder(order.id, blacklistTtlMs); // skip in cached `orders` array
-        takeOk = true;
-        localTakeCount += 1;
-        recordOtcAccountSwap(account.name);
-        updateOtcAccountSnapshot(dashboard, account.name, { tk: takesOk });
-        if (localTakeCount % pointsRefreshEvery === 0) {
-          await refreshOtcAccountPoints(client, dashboard, account.name, accountLogTag);
-        }
-        if (getOtcAccountSwapCount(account.name) >= hourlySwapCap) {
-          console.log(`${accountLogTag} [otc] hourly swap cap ${hourlySwapCap}/hr — end drain`);
-          breakDrain = true;
+
+        if (countsAsSwap) {
+          if (status === "filled") {
+            takesOk += 1;
+            statsBucket.takeOk += 1;
+            statsBucket.profitUsd += edge.estProfitUsd;
+            statsBucket.volumeUsd += edge.takerPaysUsd;
+            takeOk = true;
+          } else {
+            // failed
+            statsBucket.takeFail += 1;
+          }
+          blacklistOtcOrder(order.id, blacklistTtlMs); // skip di cached `orders` array
+          localTakeCount += 1;
+          recordOtcAccountSwap(account.name);
+          updateOtcAccountSnapshot(dashboard, account.name, { tk: takesOk });
+          if (localTakeCount % pointsRefreshEvery === 0) {
+            await refreshOtcAccountPoints(client, dashboard, account.name, accountLogTag);
+          }
+          if (getOtcAccountSwapCount(account.name) >= hourlySwapCap) {
+            console.log(`${accountLogTag} [otc] hourly swap cap ${hourlySwapCap}/hr — end drain`);
+            breakDrain = true;
+          }
+        } else {
+          // Cancelled / canceled / expired / rejected — TIDAK dihitung swap.
+          blacklistOtcOrder(order.id, blacklistTtlMs);
+          statsBucket.takeFail += 1;
         }
       } catch (error) {
         const errMsg = String(error.message || "");
@@ -9346,6 +9551,7 @@ async function runOtcAccountWorker(account, context, statsBucket) {
             balanceData = balResp.data;
             const bal = formatOtcCcUsdc(balanceData);
             updateOtcAccountSnapshot(dashboard, account.name, { cc: bal.cc, usdc: bal.usdc, eth: bal.eth });
+            maybeRefillEth(account.name, balanceData);
           }
         } catch (_) { }
       }
@@ -9484,6 +9690,7 @@ async function runOtcMakerAccountWorker(account, context, statsBucket) {
   const selfProfileId = getSelfProfileIdFromBalance(balanceData);
   const initBal = formatOtcCcUsdc(balanceData);
   updateOtcAccountSnapshot(dashboard, account.name, { status: "IDLE", cc: initBal.cc, usdc: initBal.usdc, eth: initBal.eth, mk: 0, tk: 0 });
+  maybeRefillEth(account.name, balanceData);
   await refreshOtcAccountPoints(client, dashboard, account.name, tag);
   console.log(`${tag} [maker] Profile=${selfProfileId || "?"} — start creating listings`);
 
@@ -9709,6 +9916,7 @@ async function runOtcMakerAccountWorker(account, context, statsBucket) {
         balanceData = balResp.data;
         const bal = formatOtcCcUsdc(balanceData);
         updateOtcAccountSnapshot(dashboard, account.name, { cc: bal.cc, usdc: bal.usdc, eth: bal.eth });
+        maybeRefillEth(account.name, balanceData);
       }
     } catch (_) { }
 
@@ -9851,6 +10059,7 @@ async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
   const selfProfileId = getSelfProfileIdFromBalance(balanceData);
   const initBal = formatOtcCcUsdc(balanceData);
   updateOtcAccountSnapshot(dashboard, account.name, { status: "IDLE", cc: initBal.cc, usdc: initBal.usdc, eth: initBal.eth, mk: 0, tk: 0 });
+  maybeRefillEth(account.name, balanceData);
   await refreshOtcAccountPoints(client, dashboard, account.name, tag);
   console.log(`${tag} [mt] Profile=${selfProfileId || "?"} — start (Maker→429→Taker cycle)`);
 
@@ -9923,11 +10132,11 @@ async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
     for (const o of startMyOrders) {
       if (o.reservedByProfileId) selfCancelledIds.add(String(o.id));
     }
-    // Pre-populate recorded IDs: semua order filled saat start BUKAN dari bot ini.
+    // Pre-populate recorded IDs: semua order filled/failed saat start BUKAN dari bot ini.
     // Jangan hitung sebagai swap baru.
     for (const o of startMyOrders) {
       const st = String(o.status || "").toLowerCase();
-      if (st === "filled") {
+      if (isOtcSwapCountedStatus(st)) {
         const id = String(o.id || "");
         if (o.isMaker) recordedMakerFillIds.add(id);
         else recordedSwapTakeIds.add(id);
@@ -9992,20 +10201,21 @@ async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
         const o = myOrderById.get(id);
         if (o) {
           const st = String(o.status || "").toLowerCase();
-          if (st === "filled" || st === "failed" || st === "expired" || st === "cancelled" || st === "canceled") {
+          if (isOtcTerminalStatus(st)) {
             inFlightTakeIds.delete(id);
-            // Kalau filled DAN belum pernah di-record → record sekarang.
-            // Ini menangkap take yang awalnya "pending" lalu jadi "filled".
-            if (st === "filled" && !recordedSwapTakeIds.has(id)) {
+            // Hitung sebagai swap kalau status = filled ATAU failed.
+            // Cancelled / canceled / expired / rejected TIDAK dihitung.
+            if (isOtcSwapCountedStatus(st) && !recordedSwapTakeIds.has(id)) {
               recordOtcAccountSwap(account.name);
               recordedSwapTakeIds.add(id);
-              takesOk++;
+              if (st === "filled") takesOk++;
               updateOtcAccountSnapshot(dashboard, account.name, { tk: takesOk });
               const lc = getOtcAccountSwapCount(account.name);
-              console.log(`${tag} [mt] take ${id.slice(0, 8)} FILLED → swap ${lc}/${hourlySwapCap}`);
+              const stLabel = st === "filled" ? "FILLED" : "FAILED";
+              console.log(`${tag} [mt] take ${id.slice(0, 8)} ${stLabel} → swap ${lc}/${hourlySwapCap}`);
               swapJustRecordedInPrune = true;
             } else {
-              console.log(`${tag} [mt] take ${id.slice(0, 8)} resolved (status=${st})`);
+              console.log(`${tag} [mt] take ${id.slice(0, 8)} resolved (status=${st}, not counted)`);
             }
           }
         } else if (!publicOrderIds.has(id)) {
@@ -10029,19 +10239,18 @@ async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
     // ═══════════════════════════════════════════════════════════════
     // MAKER FILL SCAN — sumber satu-satunya untuk record swap maker.
     // Scan SEMUA myOrders setiap iterasi. Kalau ada order kita yang:
-    //   - status = "filled" DAN isMaker = true
+    //   - status = "filled" ATAU "failed" DAN isMaker = true
     //   - belum pernah di-record (tidak ada di recordedMakerFillIds)
     //   - bukan self-cancelled
     // → recordOtcAccountSwap() langsung.
-    // Ini menangkap SEMUA fills tanpa peduli apakah order-nya ada di
-    // inFlightMakerIds atau tidak. Tidak ada yang terlewat.
+    // Cancelled/canceled/expired TIDAK dihitung.
     // ═══════════════════════════════════════════════════════════════
     if (makerFillBaselineSet) {
       for (const o of myOrders) {
         const id = String(o.id || "");
         if (!id) continue;
         const st = String(o.status || "").toLowerCase();
-        if (st !== "filled") continue;
+        if (!isOtcSwapCountedStatus(st)) continue;
         if (!o.isMaker) continue;
         if (recordedMakerFillIds.has(id)) continue;
         if (selfCancelledIds.has(id)) {
@@ -10049,14 +10258,15 @@ async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
           recordedMakerFillIds.add(id); // mark agar tidak cek ulang
           continue;
         }
-        // ✓ Maker fill baru terdeteksi → record swap lokal.
+        // ✓ Maker fill/failed baru terdeteksi → record swap lokal.
         recordOtcAccountSwap(account.name);
         recordedMakerFillIds.add(id);
         watchedReservedIds.delete(id);
-        makerFillsOk++;
+        if (st === "filled") makerFillsOk++;
         updateOtcAccountSnapshot(dashboard, account.name, { mk: makerFillsOk });
         const localCount = getOtcAccountSwapCount(account.name);
-        console.log(`${tag} [maker-scan] ${id.slice(0, 8)} FILLED → swap ${localCount}/${hourlySwapCap}`);
+        const stLabel = st === "filled" ? "FILLED" : "FAILED";
+        console.log(`${tag} [maker-scan] ${id.slice(0, 8)} ${stLabel} → swap ${localCount}/${hourlySwapCap}`);
         swapJustRecordedInPrune = true;
       }
       // Track settling orders (untuk serial gate display saja).
@@ -10351,51 +10561,88 @@ async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
       try {
         const takeResult = await client.takeOtcOrder(order.id);
         const filled = isObject(takeResult && takeResult.data && takeResult.data.order) ? takeResult.data.order : {};
-        const filledStatus = String(filled.status || "").toLowerCase();
-        const isSettled = filledStatus === "settled" || filledStatus === "completed" || filledStatus === "filled";
-        const isFailedTerminal = filledStatus === "failed" || filledStatus === "rejected" || filledStatus === "cancelled" || filledStatus === "canceled" || filledStatus === "expired";
+        let filledStatus = String(filled.status || "").toLowerCase();
+        const isSettledImmediate = filledStatus === "settled" || filledStatus === "completed" || filledStatus === "filled";
+        const isFailedImmediate = filledStatus === "failed" || filledStatus === "rejected";
+        const isCancelledImmediate = filledStatus === "cancelled" || filledStatus === "canceled" || filledStatus === "expired";
+        const isPendingImmediate = !isSettledImmediate && !isFailedImmediate && !isCancelledImmediate;
         const makerUsername = normalizeOtcUsername(order.makerUsername);
-        const mark = isSettled ? "OK" : (isFailedTerminal ? "FAIL" : "PEND");
+
+        // VERIFIKASI: setelah take, kalau status belum terminal, poll sampai
+        // server confirm sebelum kita keputusan cap. Ini ngehindarin race
+        // condition di mana kita over-create maker karena status belum sempat
+        // ke-record di local counter.
+        let finalStatus = filledStatus;
+        let verified = isSettledImmediate || isFailedImmediate || isCancelledImmediate;
+        if (isPendingImmediate) {
+          // Brief delay supaya server sempat propagate state.
+          await sleep(1500);
+          const verifyTimeoutMs = Math.max(5000, Number(takerCfg.takeVerifyTimeoutMs) || 20000);
+          const resolution = await waitForOtcOrderResolution(client, order.id, { timeoutMs: verifyTimeoutMs, pollIntervalMs: 2000 });
+          if (resolution.resolved && resolution.status !== "missing") {
+            finalStatus = String(resolution.status || "").toLowerCase();
+            verified = true;
+            console.log(`${tag} [taker] verify ${order.id.slice(0, 8)} → status=${finalStatus}`);
+          } else if (resolution.resolved && resolution.status === "missing") {
+            console.log(`${tag} [taker] verify ${order.id.slice(0, 8)} → missing from /orders (assume settled remotely)`);
+            // Treat missing as filled-equivalent? Aman: TIDAK record, biarin
+            // prune di iterasi berikutnya yang menentukan.
+          } else {
+            console.log(`${tag} [taker] verify ${order.id.slice(0, 8)} timeout (last=${resolution.status || "?"}) — leave as in-flight`);
+          }
+        }
+
+        const isFinalSettled = finalStatus === "settled" || finalStatus === "completed" || finalStatus === "filled";
+        const isFinalFailed = finalStatus === "failed" || finalStatus === "rejected";
+        const isFinalCancelled = finalStatus === "cancelled" || finalStatus === "canceled" || finalStatus === "expired";
+
+        const mark = isFinalSettled ? "OK" : (isFinalFailed ? "FAIL" : (isFinalCancelled ? "CXL" : "PEND"));
         if (makerUsername) {
           recordOtcCounterpartyTake(makerUsername);
           const cnt = pruneOtcCounterpartyHistory(makerUsername, Date.now()).length;
           const limit = Number(takerCfg.maxTakesPerCounterpartyPerWeek)
             || Number(takerCfg.maxTakesPerCounterpartyPerHour) || 0;
           console.log(
-            `${tag} [taker] ${mark} TOOK ${order.id.slice(0, 8)} status=${filled.status || "?"} ` +
+            `${tag} [taker] ${mark} TOOK ${order.id.slice(0, 8)} status=${finalStatus || "?"} ` +
             `maker=${order.makerUsername} (${cnt}${limit > 0 ? `/${limit}` : ""}/wk)`
           );
         } else {
-          console.log(`${tag} [taker] ${mark} TOOK ${order.id.slice(0, 8)} status=${filled.status || "?"}`);
+          console.log(`${tag} [taker] ${mark} TOOK ${order.id.slice(0, 8)} status=${finalStatus || "?"}`);
         }
-        if (isSettled) {
-          takesOk++;
-          statsBucket.takeOk = (statsBucket.takeOk || 0) + 1;
-          didTake = true;
-          takeOk = true;
-          // Record swap sukses secara lokal (100% local counting).
-          recordOtcAccountSwap(account.name);
-          recordedSwapTakeIds.add(String(order.id));
-          // Tetap tambah ke inFlightTakeIds sampai server confirm — supaya
-          // gate STRICT skip iterasi sampai resolve.
-          inFlightTakeIds.add(String(order.id));
-          // SERIAL: break drain setelah take sukses → tunggu resolve dulu.
+
+        if (verified && (isFinalSettled || isFinalFailed)) {
+          // ✓ Hitung sebagai swap: filled atau failed.
+          if (isFinalSettled) {
+            takesOk++;
+            statsBucket.takeOk = (statsBucket.takeOk || 0) + 1;
+            didTake = true;
+            takeOk = true;
+          } else {
+            statsBucket.takeFail = (statsBucket.takeFail || 0) + 1;
+          }
+          if (!recordedSwapTakeIds.has(String(order.id))) {
+            recordOtcAccountSwap(account.name);
+            recordedSwapTakeIds.add(String(order.id));
+          }
+          inFlightTakeIds.delete(String(order.id));
           breakAfterThis = true;
-        } else if (isFailedTerminal) {
-          // Terminal failed: tidak record, release slot.
+        } else if (verified && isFinalCancelled) {
+          // Cancelled/expired: TIDAK dihitung sebagai swap.
           blacklistOtcOrder(order.id, blacklistTtlMs);
           statsBucket.takeFail = (statsBucket.takeFail || 0) + 1;
+          inFlightTakeIds.delete(String(order.id));
         } else {
-          // PENDING / unknown: HOLD slot via inFlightTakeIds, tunggu server confirm.
+          // Belum ter-verifikasi (pending atau timeout): HOLD slot, biarin
+          // prune iterasi berikutnya yang resolve.
           inFlightTakeIds.add(String(order.id));
           blacklistOtcOrder(order.id, blacklistTtlMs);
-          // SERIAL: break drain — tunggu pending resolve.
           breakAfterThis = true;
         }
+
         const hrCnt = getOtcAccountSwapCount(account.name);
         // Skip this order on next pick (cached `orders` array still has it as "open")
         blacklistOtcOrder(order.id, blacklistTtlMs);
-        updateOtcAccountSnapshot(dashboard, account.name, { tk: takesOk });
+        updateOtcAccountSnapshot(dashboard, account.name, { tk: takesOk, sw: `${hrCnt}/${hourlySwapCap}` });
         mtActivityCount += 1;
         if (mtActivityCount % mtPointsRefreshEvery === 0) {
           await refreshOtcAccountPoints(client, dashboard, account.name, tag);
@@ -10437,6 +10684,7 @@ async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
             balanceData = balResp.data;
             const bal = formatOtcCcUsdc(balanceData);
             updateOtcAccountSnapshot(dashboard, account.name, { cc: bal.cc, usdc: bal.usdc, eth: bal.eth });
+            maybeRefillEth(account.name, balanceData);
           }
         } catch (_) { }
       }
@@ -10446,8 +10694,22 @@ async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
       console.log(`${tag} [taker] drain complete: ${drainCount} attempts this loop`);
     }
 
-    // ═══════════════════════════════════════════════════
-    // PHASE 2: CLEANUP — cancel stale own orders (>50% expired)
+    // ── CAP VERIFY ── setelah drain selesai, cek ulang cap.
+    // Kalau sudah tercapai → skip cleanup & maker, langsung ke cap check di atas.
+    {
+      const postDrainCount = getOtcAccountSwapCount(account.name);
+      if (postDrainCount >= hourlySwapCap) {
+        console.log(`${tag} [cap-verify] Post-drain: ${postDrainCount}/${hourlySwapCap} — cap reached, skipping maker`);
+        updateOtcAccountSnapshot(dashboard, account.name, {
+          sw: `${postDrainCount}/${hourlySwapCap}`,
+          status: "CAP"
+        });
+        makerFillBaselineSet = true;
+        await sleep(5000);
+        continue;
+      }
+    }
+
     // ═══════════════════════════════════════════════════
     const openOrders = myOrders.filter(o => o.status === "open");
     let lockedCc = 0;
@@ -10541,6 +10803,59 @@ async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
     } else if (!didTake && !idleEnoughForMaker) {
       updateOtcAccountSnapshot(dashboard, account.name, { status: "WAIT" });
     } else if (!didTake && idleEnoughForMaker && effectiveMaxOpen > 0 && currentOpenCount < maxOpenOrders) {
+      // ── PRE-MAKER VERIFY ── verifikasi terakhir sebelum open maker.
+      // Re-fetch myOrders + jalankan ulang scan untuk catch fill/failed
+      // yang terjadi barusan, biar cap check di sini valid.
+      try {
+        const verifyRes = await client.getCrossOtcOrders(true);
+        const verifyOrders = Array.isArray(verifyRes && verifyRes.data && verifyRes.data.orders)
+          ? verifyRes.data.orders
+          : (Array.isArray(verifyRes && verifyRes.data) ? verifyRes.data : []);
+        // Re-scan filled+failed sebelum cap check.
+        for (const o of verifyOrders) {
+          const oid = String(o.id || "");
+          if (!oid) continue;
+          const stv = String(o.status || "").toLowerCase();
+          if (!isOtcSwapCountedStatus(stv)) continue;
+          if (recordedMakerFillIds.has(oid) || recordedSwapTakeIds.has(oid)) continue;
+          if (selfCancelledIds.has(oid)) {
+            selfCancelledIds.delete(oid);
+            if (o.isMaker) recordedMakerFillIds.add(oid);
+            else recordedSwapTakeIds.add(oid);
+            continue;
+          }
+          recordOtcAccountSwap(account.name);
+          if (o.isMaker) recordedMakerFillIds.add(oid);
+          else recordedSwapTakeIds.add(oid);
+          const lc = getOtcAccountSwapCount(account.name);
+          const stLabel = stv === "filled" ? "FILLED" : "FAILED";
+          console.log(`${tag} [pre-maker-verify] ${oid.slice(0, 8)} ${stLabel} → swap ${lc}/${hourlySwapCap}`);
+        }
+        // Cek ulang cap setelah verify.
+        const postVerifyCount = getOtcAccountSwapCount(account.name);
+        if (postVerifyCount >= hourlySwapCap) {
+          console.log(`${tag} [pre-maker-verify] cap reached ${postVerifyCount}/${hourlySwapCap} — abort maker create`);
+          updateOtcAccountSnapshot(dashboard, account.name, {
+            sw: `${postVerifyCount}/${hourlySwapCap}`,
+            status: "CAP"
+          });
+          makerFillBaselineSet = true;
+          await sleep(5000);
+          continue;
+        }
+        // Cek ulang in-flight: ada order baru yang masih open?
+        const stillOpenAny = verifyOrders.some(o => String(o.status || "").toLowerCase() === "open");
+        if (stillOpenAny) {
+          console.log(`${tag} [pre-maker-verify] open order detected — defer maker, wait next iter`);
+          await sleep(5000);
+          continue;
+        }
+      } catch (verifyErr) {
+        console.log(`${tag} [pre-maker-verify] fetch failed: ${verifyErr.message} — defer maker`);
+        await sleep(5000);
+        continue;
+      }
+
       // Refresh balance before maker create
       try {
         const balResp = await client.getBalances();
@@ -10548,6 +10863,7 @@ async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
           balanceData = balResp.data;
           const bal = formatOtcCcUsdc(balanceData);
           updateOtcAccountSnapshot(dashboard, account.name, { cc: bal.cc, usdc: bal.usdc, eth: bal.eth });
+          maybeRefillEth(account.name, balanceData);
         }
       } catch (_) { }
 
@@ -10614,6 +10930,33 @@ async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
           if (mtActivityCount % mtPointsRefreshEvery === 0) {
             await refreshOtcAccountPoints(client, dashboard, account.name, tag);
           }
+          // POST-CREATE VERIFY — wait until server confirms listing visible
+          // di /orders mine. Mencegah race condition di mana iterasi berikutnya
+          // belum lihat order ini & open maker lagi.
+          if (createdOrder && createdOrder.id) {
+            await sleep(2000); // brief delay supaya server sync
+            const verifyTimeoutMs = Math.max(3000, Number(makerCfg.createVerifyTimeoutMs) || 12000);
+            const verifyDeadline = Date.now() + verifyTimeoutMs;
+            let seenOnServer = false;
+            while (Date.now() < verifyDeadline) {
+              try {
+                const checkRes = await client.getCrossOtcOrders(true);
+                const checkOrders = Array.isArray(checkRes && checkRes.data && checkRes.data.orders)
+                  ? checkRes.data.orders
+                  : (Array.isArray(checkRes && checkRes.data) ? checkRes.data : []);
+                if (checkOrders.some(o => String(o.id) === String(createdOrder.id))) {
+                  seenOnServer = true;
+                  break;
+                }
+              } catch (_) { /* retry */ }
+              await sleep(1500);
+            }
+            if (seenOnServer) {
+              console.log(`${tag} [maker] verify ${createdOrder.id.slice(0, 8)} visible on server`);
+            } else {
+              console.log(`${tag} [maker] verify ${createdOrder.id.slice(0, 8)} NOT visible after ${verifyTimeoutMs}ms — leave as in-flight`);
+            }
+          }
         } catch (error) {
           const errMsg = String(error.message || "");
           if (errMsg.includes("429") || errMsg.toLowerCase().includes("too many")) {
@@ -10644,6 +10987,7 @@ async function runOtcMakerTakerAccountWorker(account, context, statsBucket) {
         balanceData = balResp.data;
         const bal = formatOtcCcUsdc(balanceData);
         updateOtcAccountSnapshot(dashboard, account.name, { cc: bal.cc, usdc: bal.usdc, eth: bal.eth });
+        maybeRefillEth(account.name, balanceData);
       }
     } catch (_) { }
 
@@ -11540,6 +11884,9 @@ async function run() {
   }
 
   if (sendMode === "otc-maker" || sendMode === "otc-taker" || sendMode === "otc-maker-taker") {
+    // Initialize ETH auto-fill from master wallet (continuous monitoring)
+    initEthAutoFill(rawAccounts.masterWalletPrivateKey);
+
     const otcAccounts = accounts.accounts;
     console.log(`\n[init] OTC mode=${sendMode} - using all ${otcAccounts.length} accounts`);
     const otcContext = {
